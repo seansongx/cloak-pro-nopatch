@@ -38,7 +38,7 @@ const PATCHED_OPCODE = 0xb8;
 const START_PATH = '/api/license/session/start';
 const END_PATH = '/api/license/session/end';
 const PUBKEY_BACKOFF = 0x20; // key occupies the 32 bytes right before END_PATH
-const SLOT_SCAN_BYTES = 24; // how far past `lea r9,[rip+key]` the slot can sit
+const SLOT_SCAN_BYTES = 48; // how far past `lea r9,[rip+key]` the slot can sit
 
 /** Builds whose site table is known up front (sha256 of the *unpatched* DLL). */
 const PROFILES = [
@@ -53,6 +53,16 @@ const PROFILES = [
         sha256: '336f3af913c2a3cdbc6679ada4550ff04b80e27ade54a6c8d8fbb64c9877ff74',
         verifyVa: 0x188b3eb50,
         sites: [0x18960dfba, 0x18960f520, 0x18961000d, 0x189610c20],
+    },
+    {
+        // chromium-156.0.8078.47.7-pro (Windows x64). Note: the `mov r8,r13`
+        // before one gate ends in an `e8` ModRM byte, so the old "first e8"
+        // heuristic false-positives one byte early; the sites below are the
+        // real `call verify` instructions and discovery now groups by target.
+        version: '156.0.8078.47.7',
+        sha256: '1d34c68df07a423b0c431f18330ce89fb7c4d51daec05b475168be6e0f2b0252',
+        verifyVa: 0x188cdb510,
+        sites: [0x1897ac181, 0x1897ada94, 0x1897ae66f, 0x1897af2d4],
     },
 ];
 
@@ -220,43 +230,82 @@ function findPubkeyVa(fd, pe) {
     return pubVa;
 }
 
-/** The 5-byte slot following one `lea r9, [rip+pubkey]`. */
-function slotAfterLea(fd, leaOffset, leaVa) {
+/**
+ * Everything right after one `lea r9, [rip+pubkey]` that could be a gate slot:
+ *   - every `call rel32` whose target lands inside .text (the untouched gate), and
+ *   - a `mov eax,1` slot (`B8 01 00 00 00`) left by a previous bypass.
+ *
+ * Scanning for the *first* `e8` is too naive: the instruction right before the
+ * real call can end in an `e8` ModRM byte (e.g. `4d 89 e8` = `mov r8, r13`),
+ * so a byte-scan finds a "call" one byte early whose target jumps out of range.
+ * Collecting only in-range calls and grouping by target fixes that.
+ */
+function candidatesAfterLea(fd, leaOffset, leaVa, textLo, textHi) {
     const window = readAt(fd, leaOffset + 7, SLOT_SCAN_BYTES);
+    const calls = [];
+    const patched = [];
     for (let i = 0; i + 5 <= window.length; i++) {
-        const va = leaVa + 7 + i;
-        if (window[i] === CALL_OPCODE) {
-            return { va, patched: false, verifyVa: va + 5 + window.readInt32LE(i + 1) };
-        }
         if (window[i] === PATCHED_OPCODE && window.readInt32LE(i + 1) === 1) {
-            return { va, patched: true, verifyVa: null };
+            patched.push(leaVa + 7 + i);
+        } else if (window[i] === CALL_OPCODE) {
+            const va = leaVa + 7 + i;
+            const target = va + 5 + window.readInt32LE(i + 1);
+            if (target >= textLo && target < textHi) calls.push({ va, target });
         }
     }
-    return null;
+    return { calls, patched };
 }
 
-/** Version- and state-independent: anchor on the key, follow every `lea r9`. */
+/**
+ * Version- and state-independent: anchor on the key blob, follow every
+ * `lea r9, [rip+pubkey]`, and keep the call target they all share — that shared
+ * target is the Ed25519 verify routine and its call sites are the gate slots.
+ * A lone target (only one ref ever points at it) is not trusted, so a stray
+ * in-range `call` cannot masquerade as the gate routine. Works on an untouched
+ * build (`E8` slots) and on an already-bypassed one (`mov eax,1`).
+ */
 function discoverSites(fd, pe) {
     const pubVa = findPubkeyVa(fd, pe);
     if (pubVa == null) return null;
     const text = sectionByName(pe, '.text');
     if (!text) return null;
+    const textLo = pe.imageBase + text.va;
+    const textHi = textLo + text.rawSize;
 
-    const slots = [];
+    const callSites = [];
+    const patchedSites = [];
     for (const refOffset of findRipRefsTo(fd, pe, pubVa)) {
         if (refOffset < text.rawPtr || refOffset >= text.rawPtr + text.rawSize) continue;
         const leaVa = pe.imageBase + text.va + (refOffset - text.rawPtr);
-        const slot = slotAfterLea(fd, refOffset, leaVa);
-        if (slot) slots.push(slot);
+        const { calls, patched } = candidatesAfterLea(fd, refOffset, leaVa, textLo, textHi);
+        callSites.push(...calls);
+        patchedSites.push(...patched);
     }
-    if (!slots.length) return null;
+
+    const byTarget = new Map();
+    for (const call of callSites) {
+        if (!byTarget.has(call.target)) byTarget.set(call.target, []);
+        byTarget.get(call.target).push(call.va);
+    }
+    let verifyVa = null;
+    let gateSites = [];
+    if (byTarget.size) {
+        const [bestTarget, bestSites] = [...byTarget.entries()].sort((a, b) => b[1].length - a[1].length)[0];
+        if (bestSites.length >= 2) {
+            verifyVa = bestTarget;
+            gateSites = bestSites;
+        }
+    }
+    gateSites = gateSites.concat(patchedSites);
 
     const seen = new Set();
-    const unique = slots.filter(slot => (seen.has(slot.va) ? false : (seen.add(slot.va), true)));
+    const unique = gateSites.filter(va => (seen.has(va) ? false : (seen.add(va), true))).sort((a, b) => a - b);
+    if (!unique.length) return null;
+
     return {
-        verifyVa: unique.find(slot => slot.verifyVa != null)?.verifyVa ?? null,
-        sites: unique.map(slot => slot.va).sort((a, b) => a - b),
-        source: `pubkey ${hex(pubVa)} (${unique.filter(slot => slot.patched).length}/${unique.length} patched)`,
+        verifyVa,
+        sites: unique,
+        source: `pubkey ${hex(pubVa)} (${patchedSites.length}/${unique.length} patched)`,
         discovered: true,
     };
 }

@@ -114,9 +114,12 @@ const browser = await launch({
 
 1. **只读检查** `chrome.dll`：定位 license runtime 的签名校验槽位，判断这个构建是否已经绕过。
    检测方式是**公钥锚定**，与版本、与是否已补过都无关：内嵌的 32 字节服务端公钥正好位于
-   `/api/license/session/end` 字符串前 `0x20` 字节，找所有 `lea r9, [rip+公钥]`，其后十几字节
-   内就是那个 5 字节槽位 —— `E8 rel32` 表示未补，`B8 01 00 00 00` 表示已补。所以自动更新到新
-   Chromium、或换成别的工具补过的包，都能正确识别（`patched: true`）；
+   `/api/license/session/end` 字符串前 `0x20` 字节，找所有 `lea r9, [rip+公钥]`，其后就是那个
+   5 字节槽位 —— `E8 rel32`（`call ED25519_verify`）表示未补，`B8 01 00 00 00` 表示已补。
+   多个槽位会**共同指向同一个 verify 例程**，所以发现逻辑按 `call` 目标分组、取被多数 `lea`
+   共同指向的那个目标作为 verify（并要求至少 2 处），而不是傻找「后面第一个 `e8`」——156 版里
+   某个槽位前面的 `mov r8,r13`（`4d 89 e8`）其 ModRM 字节正好是 `e8`，旧启发式会误判一位。
+   这样自动更新到新 Chromium、或换成别的工具补过的包，都能正确识别（`patched: true`）；
 2. **进程内起本地授权 API**（随机端口，仅 `127.0.0.1`），每个实例发独立 `business` 租约；
 3. **注入两个变量再启动**：`CLOAKBROWSER_LICENSE_API`（指向本地 API）和
    `executablePath` / `CLOAKBROWSER_BINARY_PATH`（锁定到你指定的构建，避免包装层另下别的版本）。
@@ -127,6 +130,13 @@ const browser = await launch({
 |---|---|---|---|
 | 154.0.8037.57.1 | `8a9f1e9020bac1f4…` | `0x1888c3010` | 4 |
 | 155.0.8059.39.1 | `336f3af913c2a3cd…` | `0x188b3eb50` | 4 |
+| 156.0.8078.47.7（Win x64） | `1d34c68df07a423b…` | `0x188cdb510` | 4 |
+
+> 156 版（Windows x64 为 `156.0.8078.47.7`，Linux 为 `156.0.8078.47.8`）签名门结构未变：
+> 仍是 4 处 `call ED25519_verify`，只是发现逻辑需要按目标分组才不会误命中（见上面第 1 条）。
+> 未在表里的新构建照样可跑：`patch.js` / `inspectBrowser` 会用公钥锚定自动发现槽位，
+> 只是少了一次 sha256 秒级识别。拿到新构建后跑一次 `node ./patch.js "<目录>" --json` 即可
+> 把它的 sha256 / verify / sites 补进两张表。
 
 ## API
 
@@ -253,3 +263,21 @@ cloak-pro-nopatch/
   不在 `dist/` 内，不受此约束）；
 - 新增构建版本时只需往 `KNOWN_PROFILES`（运行时）和 `patch.js` 的 `PROFILES`（补丁 CLI）里各补一条，
   其余场景由公钥锚定发现兜底。
+
+## 发布（GitHub → npm）
+
+一条链：**推到 GitHub → 打 tag / 发 Release → GitHub Actions 自动同步到 npm**。
+
+1. 仓库里放好 `.github/workflows/npm-publish.yml`（已包含）。触发条件：push `v*` tag、发布 Release，或手动 `workflow_dispatch`。
+2. 在仓库 **Settings → Secrets and variables → Actions** 新建 secret **`NPM_TOKEN`**（npm 的 Automation/Access Token，`npm token create` 或官网生成）。这是唯一需要你手动配置的凭据，代码里不存任何 token。
+3. 发版：
+   ```bash
+   # 先升版本（例如 1.3.0），提交并推 main；再打标签推送
+   git tag v1.3.0
+   git push origin v1.3.0
+   ```
+   tag 推上去后 Action 会：`npm ci` → `npm run typecheck` → 校验 tag 与 `package.json` 版本一致 → `npm publish --access public --provenance`（`prepublishOnly` 会自动 `build`）。
+4. `npm publish` 的 registry 由 `publishConfig.registry = https://registry.npmjs.org/` 固定，避免本机 `npmmirror` 默认 registry 干扰；`--provenance` 需要仓库为 public。
+
+> 本机若直接 `npm publish`，先 `npm login` 且 registry 指向 `https://registry.npmjs.org/`（`~/.npmrc` 里现在默认是 npmmirror 镜像，不能发布）。
+
