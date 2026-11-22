@@ -246,6 +246,9 @@ cloak-pro-nopatch/
 
 ## 维护
 
+> **升级到新的 CloakBrowser 版本**：完整步骤见 [docs/UPGRADING-CLOAKBROWSER.md](docs/UPGRADING-CLOAKBROWSER.md)；
+> 定位签名门用 `node tools/find-gate.mjs <chrome.dll>`，输出可直接粘进 `PROFILES` / `KNOWN_PROFILES`。
+
 | 命令 | 作用 |
 |---|---|
 | `npm run build` | 先清 `dist/` 再编译（无 sourcemap，产物 20 个文件） |
