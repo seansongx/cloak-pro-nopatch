@@ -48,11 +48,11 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/xsong13/cloak-pro-nopatch.git"
+        "url": "git+https://github.com/seansongx/cloak-pro-nopatch.git"
     },
-    "homepage": "https://github.com/xsong13/cloak-pro-nopatch#readme",
+    "homepage": "https://github.com/seansongx/cloak-pro-nopatch#readme",
     "bugs": {
-        "url": "https://github.com/xsong13/cloak-pro-nopatch/issues"
+        "url": "https://github.com/seansongx/cloak-pro-nopatch/issues"
     },
     "publishConfig": {
         "access": "public",
